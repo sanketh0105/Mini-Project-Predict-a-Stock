@@ -1,0 +1,8 @@
+{
+  "name": "Predict-A-Stock",
+  "description": "SME Inventory Optimization & Resilience Resilience Tool with Real-Time Disruption Simulation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
