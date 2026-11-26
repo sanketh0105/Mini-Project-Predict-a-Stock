@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import Papa from 'papaparse';
 import { Sidebar } from './components/Sidebar';
 import { StatusTable } from './components/StatusTable';
@@ -11,7 +11,7 @@ import { InventoryResult, SalesRow, BurnDownData } from './types';
 import { Upload, FileSpreadsheet, Package, AlertCircle, TrendingUp, Info, Sparkles, Globe, Search, Cpu, Download, Play } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { generateSupplierEmail, analyzeDisruptionRisk, RiskAnalysis } from './services/geminiService';
-import { validateInventoryCsv, CsvValidationResult } from './utils/csvValidator';
+import { validateInventoryCsv, processInventoryRows, CsvValidationResult } from './utils/csvValidator';
 
 const SAMPLE_CSV_DATA = `Date,Product_ID,Units_Sold,Current_Stock
 2026-10-01,SKU-ALPHA-101,42,480
@@ -40,6 +40,7 @@ export default function App() {
     rows: SalesRow[];
     validation: CsvValidationResult;
   } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   
   // Theme State
   const [isDarkMode, setIsDarkMode] = useState(() => {
@@ -170,24 +171,50 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ data: rows, leadTime: 5, serviceLevel: 0.95 })
       });
-      const json = await response.json();
-      if (!response.ok || !Array.isArray(json)) {
+
+      if (response.ok) {
+        const json = await response.json().catch(() => null);
+        if (Array.isArray(json) && json.length > 0) {
+          setUploadError(null);
+          setData(json);
+          return;
+        }
+      } else if (response.status === 400) {
+        const errJson = await response.json().catch(() => null);
         setUploadError({
-          message: json?.error || `Server failed to process CSV (HTTP ${response.status}).`,
+          message: errJson?.error || "Server rejected the CSV format.",
         });
         return;
       }
-      if (json.length === 0) {
-        setUploadError({ message: "No valid SKU records could be extracted from the CSV." });
+
+      // Automatic local fallback if backend is restarting, 502/404, or running statically
+      const localResults = processInventoryRows(
+        rows as unknown as Record<string, unknown>[],
+        5,
+        fields
+      );
+      if (localResults.length > 0) {
+        setUploadError(null);
+        setData(localResults);
         return;
       }
-      setUploadError(null);
-      setData(json);
+
+      setUploadError({ message: "No valid SKU records could be extracted from the CSV." });
     } catch (err: any) {
-      console.error("CSV processing error:", err);
-      setUploadError({
-        message: err?.message || "Network error while processing CSV data. Please ensure the server is running.",
-      });
+      console.warn("Backend inventory API unreachable, using local processor:", err?.message);
+      const localResults = processInventoryRows(
+        rows as unknown as Record<string, unknown>[],
+        5,
+        fields
+      );
+      if (localResults.length > 0) {
+        setUploadError(null);
+        setData(localResults);
+      } else {
+        setUploadError({
+          message: err?.message || "Failed to process CSV data.",
+        });
+      }
     } finally {
       setLoading(false);
     }
@@ -204,42 +231,49 @@ export default function App() {
 
     setLoading(true);
     setUploadError(null);
-    Papa.parse<SalesRow>(file, {
-      header: true,
-      skipEmptyLines: 'greedy',
-      transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
-      complete: (results) => {
-        setLoading(false);
-        if (results.errors && results.errors.length > 0 && (!results.data || results.data.length === 0)) {
-          setUploadError({ message: `CSV parse error: ${results.errors[0].message}` });
-          return;
+    try {
+      Papa.parse<SalesRow>(file, {
+        header: true,
+        skipEmptyLines: 'greedy',
+        transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
+        complete: (results) => {
+          setLoading(false);
+          if (results.errors && results.errors.length > 0 && (!results.data || results.data.length === 0)) {
+            setUploadError({ message: `CSV parse error: ${results.errors[0].message}` });
+            return;
+          }
+          const rows = results.data || [];
+          const headers =
+            results.meta?.fields && results.meta.fields.length > 0
+              ? results.meta.fields
+              : rows[0]
+                ? Object.keys(rows[0])
+                : [];
+          const validation = validateInventoryCsv(
+            rows as unknown as Record<string, unknown>[],
+            headers
+          );
+          setPendingCsv({
+            fileName: file.name,
+            headers,
+            rows,
+            validation,
+          });
+        },
+        error: (err) => {
+          console.error("PapaParse error:", err);
+          setUploadError({
+            message: `Could not read CSV file: ${err?.message || "Unknown file read error."}`,
+          });
+          setLoading(false);
         }
-        const rows = results.data || [];
-        const headers =
-          results.meta?.fields && results.meta.fields.length > 0
-            ? results.meta.fields
-            : rows[0]
-              ? Object.keys(rows[0])
-              : [];
-        const validation = validateInventoryCsv(
-          rows as unknown as Record<string, unknown>[],
-          headers
-        );
-        setPendingCsv({
-          fileName: file.name,
-          headers,
-          rows,
-          validation,
-        });
-      },
-      error: (err) => {
-        console.error("PapaParse error:", err);
-        setUploadError({
-          message: `Could not read CSV file: ${err?.message || "Unknown file read error."}`,
-        });
-        setLoading(false);
-      }
-    });
+      });
+    } catch (err: any) {
+      setUploadError({
+        message: `Could not read CSV file: ${err?.message || "Unexpected error."}`,
+      });
+      setLoading(false);
+    }
   };
 
   const handleConfirmPreviewUpload = async () => {
@@ -274,17 +308,22 @@ export default function App() {
     }
   };
 
-  const handleLoadSampleDataset = () => {
+  const handleLoadSampleDataset = async () => {
     setLoading(true);
     setUploadError(null);
-    Papa.parse<SalesRow>(SAMPLE_CSV_DATA, {
-      header: true,
-      skipEmptyLines: 'greedy',
-      transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
-      complete: async (results) => {
-        await submitParsedRows(results.data, results.meta?.fields);
-      }
-    });
+    try {
+      const results = Papa.parse<SalesRow>(SAMPLE_CSV_DATA, {
+        header: true,
+        skipEmptyLines: 'greedy',
+        transformHeader: (header) => header.replace(/^\uFEFF/, '').trim(),
+      });
+      await submitParsedRows(results.data, results.meta?.fields);
+    } catch (err: any) {
+      setUploadError({
+        message: err?.message || "Failed to load sample dataset.",
+      });
+      setLoading(false);
+    }
   };
 
   const handleDownloadSampleCsv = () => {
@@ -324,12 +363,24 @@ export default function App() {
               <Cpu size={14} className="text-brand" />
               Engine: <span className="text-app-text">v1.2-AI</span>
             </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,text/csv,application/csv,application/vnd.ms-excel"
+              className="hidden"
+              onChange={handleFileUpload}
+              disabled={loading}
+            />
             {data.length > 0 && (
-              <label className="cursor-pointer bg-brand hover:bg-brand/90 text-white px-5 py-2.5 rounded-xl text-xs font-black transition-all flex items-center gap-2 shadow-lg shadow-brand/20 uppercase tracking-widest">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={loading}
+                className="cursor-pointer bg-brand hover:bg-brand/90 text-white px-5 py-2.5 rounded-xl text-xs font-black transition-all flex items-center gap-2 shadow-lg shadow-brand/20 uppercase tracking-widest disabled:opacity-50"
+              >
                 <Upload size={16} />
                 <span>{loading ? "Syncing..." : "Sync Data"}</span>
-                <input type="file" accept=".csv,text/csv,application/csv,application/vnd.ms-excel" className="hidden" onChange={handleFileUpload} disabled={loading} />
-              </label>
+              </button>
             )}
           </div>
         </header>
@@ -543,19 +594,17 @@ export default function App() {
                         Drag and drop or upload your SME historical sales CSV (<code className="text-brand font-semibold">Date, Product_ID, Units_Sold</code> — also accepts <code className="text-brand font-semibold">SKU</code>, <code className="text-brand font-semibold">Quantity</code>, and optional <code className="text-brand font-semibold">Current_Stock</code>).
                       </p>
                       <div className="flex flex-wrap items-center justify-center gap-4">
-                        <label className="group relative cursor-pointer bg-brand px-8 py-4 rounded-2xl text-white font-black uppercase text-xs tracking-widest hover:scale-105 active:scale-95 transition-all shadow-2xl shadow-brand/30 border border-white/10">
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          disabled={loading}
+                          className="group relative cursor-pointer bg-brand px-8 py-4 rounded-2xl text-white font-black uppercase text-xs tracking-widest hover:scale-105 active:scale-95 transition-all shadow-2xl shadow-brand/30 border border-white/10 disabled:opacity-50"
+                        >
                           <div className="flex items-center gap-3">
                             <Upload size={18} />
                             <span>{loading ? "Initializing..." : "Upload CSV Manifest"}</span>
                           </div>
-                          <input
-                            type="file"
-                            accept=".csv,text/csv,application/csv,application/vnd.ms-excel"
-                            className="hidden"
-                            onChange={handleFileUpload}
-                            disabled={loading}
-                          />
-                        </label>
+                        </button>
 
                         <button
                           type="button"

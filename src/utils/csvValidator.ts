@@ -1,3 +1,5 @@
+import { InventoryResult } from '../types';
+
 export interface CsvValidationResult {
   valid: boolean;
   error?: string;
@@ -298,4 +300,78 @@ export function validateInventoryCsv(
     mappedColumns,
     validRowCount,
   };
+}
+
+/**
+ * Aggregates validated CSV sales rows into per-SKU inventory metrics.
+ * Used as a resilient client-side fallback if /api/process-inventory is unreachable.
+ */
+export function processInventoryRows(
+  rows: Record<string, unknown>[],
+  baseLeadTime = 5,
+  fields?: string[]
+): InventoryResult[] {
+  const validation = validateInventoryCsv(rows, fields);
+  const { productId, unitsSold, date, currentStock, leadTime } = validation.mappedColumns;
+  if (!productId || !unitsSold) return [];
+
+  const products: Record<
+    string,
+    {
+      totalSold: number;
+      days: Set<string>;
+      sku: string;
+      explicitStock?: number;
+      explicitLeadTime?: number;
+    }
+  > = {};
+
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const sku = String(row[productId] ?? '').trim();
+    if (!sku) continue;
+
+    const parsedUnits = parseNumericValue(row[unitsSold]);
+    const units = parsedUnits !== null && parsedUnits >= 0 ? parsedUnits : 0;
+    const dateVal = date && row[date] !== undefined ? String(row[date]).trim() : '';
+
+    if (!products[sku]) {
+      products[sku] = { totalSold: 0, days: new Set(), sku };
+    }
+    products[sku].totalSold += units;
+    if (dateVal) {
+      products[sku].days.add(dateVal);
+    }
+
+    if (currentStock && row[currentStock] !== undefined && String(row[currentStock]).trim() !== '') {
+      const parsedStock = parseNumericValue(row[currentStock]);
+      if (parsedStock !== null && parsedStock >= 0) {
+        products[sku].explicitStock = Math.floor(parsedStock);
+      }
+    }
+
+    if (leadTime && row[leadTime] !== undefined && String(row[leadTime]).trim() !== '') {
+      const parsedLt = parseNumericValue(row[leadTime]);
+      if (parsedLt !== null && parsedLt >= 0) {
+        products[sku].explicitLeadTime = parsedLt;
+      }
+    }
+  }
+
+  return Object.values(products).map((p) => {
+    const numDays = p.days.size || 1;
+    const avgDailyDemand = p.totalSold / numDays;
+    const effectiveLt = p.explicitLeadTime ?? baseLeadTime;
+    const safetyStock = avgDailyDemand * effectiveLt * 0.2;
+    const reorderPoint = avgDailyDemand * effectiveLt + safetyStock;
+
+    return {
+      sku: p.sku,
+      avgDailyDemand,
+      safetyStock,
+      reorderPoint,
+      currentStock: p.explicitStock ?? Math.max(0, Math.floor(avgDailyDemand * 15)),
+      leadTime: effectiveLt,
+    };
+  });
 }
